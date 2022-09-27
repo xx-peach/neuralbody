@@ -6,22 +6,40 @@ import trimesh
 
 
 def get_rays(H, W, K, R, T):
-    # calculate the camera origin
-    rays_o = -np.dot(R.T, T).ravel()
-    # calculate the world coodinates of pixels
+    """ Function for Ray Generation, Matrix Multiplicaion
+    Args:
+        H, W - int, the height and width of the input image
+        K    - (3, 3) of float32 the camera intrinsic matrix
+        R    - (3, 3) of float32, rotation matrix from world to camera
+        T    - (3,) of float32, translation matrix from world to camera
+    Returns:
+        rays_o - (H, W, 3), duplication of (3, ) camera origin in world coordinate
+        rays_d - (H, W, 3), camera directions in world coordinate, same as NeRF
+    """
+    # calculate the camera origin, RX + T = 0 -> X = R.inv @ -T
+    rays_o = -np.dot(R.T, T).ravel()                    # (3,)
+    
+    # calculate the world coodinates of pixels using `np.meshgrid()`
     i, j = np.meshgrid(np.arange(W, dtype=np.float32),
                        np.arange(H, dtype=np.float32),
                        indexing='xy')
-    xy1 = np.stack([i, j, np.ones_like(i)], axis=2)
-    pixel_camera = np.dot(xy1, np.linalg.inv(K).T)
-    pixel_world = np.dot(pixel_camera - T.ravel(), R)
-    # calculate the ray direction
-    rays_d = pixel_world - rays_o[None, None]
-    rays_o = np.broadcast_to(rays_o, rays_d.shape)
+    xy1 = np.stack([i, j, np.ones_like(i)], axis=2)     # (H, W, 3)
+    pixel_camera = np.dot(xy1, np.linalg.inv(K).T)      # (H, W, 3), same as K.inv @ xy1.T
+    pixel_world = np.dot(pixel_camera - T.ravel(), R)   # (H, W, 3)
+    
+    #! calculate the ray direction, 下面减 rays_o 是因为上面是计算了 pixel_world 而不是只是乘了 R
+    rays_d = pixel_world - rays_o[None, None]           # (H, W, 3)
+    rays_o = np.broadcast_to(rays_o, rays_d.shape)      # (H, W, 3)
     return rays_o, rays_d
 
 
 def get_bound_corners(bounds):
+    """ Generate 3d Bounding Box's 8 Vertices Coordinate(World)
+    Args:
+        bounds - (2, 3) of float32, human vertices bound in world coordinates
+    Returns:
+        corners_3d - (8, 3) of float32, 3d bounding box coordinates of 6890 smpl vertices
+    """
     min_x, min_y, min_z = bounds[0]
     max_x, max_y, max_z = bounds[1]
     corners_3d = np.array([
@@ -38,50 +56,100 @@ def get_bound_corners(bounds):
 
 
 def get_bound_2d_mask(bounds, K, pose, H, W):
-    corners_3d = get_bound_corners(bounds)
-    corners_2d = base_utils.project(corners_3d, K, pose)
-    corners_2d = np.round(corners_2d).astype(int)
+    """ Generate 2d Image Mask Projected from 3d Vertices Bouning Box
+    Args:
+        bounds - (2, 3) of float32, human vertices bound in world coordinates
+        K      - (3, 3) of float32, camera's intrinsic matrix
+        pose   - (3, 4) of float32, project matrix from world to camera
+        H, W   - int, the height and width of the input image
+    Returns:
+        mask - (H, W) of 0/1, 2d human mask projected from 3d smpl vertices bounding box
+    """
+    corners_3d = get_bound_corners(bounds)                  # (8, 3), 3d bounding box
+    corners_2d = base_utils.project(corners_3d, K, pose)    # (8, 3), project 3d bounding box to image
+    corners_2d = np.round(corners_2d).astype(int)           # (8, 3), rounded to int
+    # use `cv2.fillPoly()` to draw the mask of 2d bounding box projected from 3d world bounding box
     mask = np.zeros((H, W), dtype=np.uint8)
-    cv2.fillPoly(mask, [corners_2d[[0, 1, 3, 2, 0]]], 1)
-    cv2.fillPoly(mask, [corners_2d[[4, 5, 7, 6, 5]]], 1)
-    cv2.fillPoly(mask, [corners_2d[[0, 1, 5, 4, 0]]], 1)
-    cv2.fillPoly(mask, [corners_2d[[2, 3, 7, 6, 2]]], 1)
-    cv2.fillPoly(mask, [corners_2d[[0, 2, 6, 4, 0]]], 1)
-    cv2.fillPoly(mask, [corners_2d[[1, 3, 7, 5, 1]]], 1)
+    cv2.fillPoly(mask, [corners_2d[[0, 1, 3, 2, 0]]], 1)    # verticel left plane
+    cv2.fillPoly(mask, [corners_2d[[4, 5, 7, 6, 5]]], 1)    # verticle right plane
+    cv2.fillPoly(mask, [corners_2d[[0, 1, 5, 4, 0]]], 1)    # verticle back plane
+    cv2.fillPoly(mask, [corners_2d[[2, 3, 7, 6, 2]]], 1)    # verticle front plane
+    cv2.fillPoly(mask, [corners_2d[[0, 2, 6, 4, 0]]], 1)    # bottom plane
+    cv2.fillPoly(mask, [corners_2d[[1, 3, 7, 5, 1]]], 1)    # top plane
     return mask
 
 
 def get_near_far(bounds, ray_o, ray_d):
-    """calculate intersections with 3d bounding box"""
-    norm_d = np.linalg.norm(ray_d, axis=-1, keepdims=True)
-    viewdir = ray_d / norm_d
-    viewdir[(viewdir < 1e-5) & (viewdir > -1e-10)] = 1e-5
-    viewdir[(viewdir > -1e-5) & (viewdir < 1e-10)] = -1e-5
-    tmin = (bounds[:1] - ray_o[:1]) / viewdir
-    tmax = (bounds[1:2] - ray_o[:1]) / viewdir
-    t1 = np.minimum(tmin, tmax)
-    t2 = np.maximum(tmin, tmax)
-    near = np.max(t1, axis=-1)
-    far = np.min(t2, axis=-1)
-    mask_at_box = near < far
-    near = near[mask_at_box] / norm_d[mask_at_box, 0]
-    far = far[mask_at_box] / norm_d[mask_at_box, 0]
+    """ Calculate Intersections with 3D Bounding Box Using 3D Slabs Principle
+        https://blog.csdn.net/weixin_40301728/article/details/114239266
+    Args:
+        bounds - (2, 3) of float32, human vertices bound in world coordinates
+        ray_o  - (nbody+nrand, 3), duplication of (3, ) camera origin in world coordinate
+        ray_d  - (nbody+nrand, 3), 这个还不知道到底是啥东西现在
+    Returns:
+        near        - (n,) of float32, near distance for those rays intersecting with the 3d bounding box
+        far         - (n,) of float32, far distance for those rays intersecting with the 3d bounding box
+        mask_at_box - (nbody+nrand,) of int32, 1 if that ray intersects with the 3d bounding box
+    """
+    # normalize all H*W input rays' direction, get H*W normalized view directions
+    norm_d = np.linalg.norm(ray_d, axis=-1, keepdims=True)  # (nbody+nrand, 1)
+    viewdir = ray_d / norm_d                                # (nbody+nrand, 3)
+    # truncate numerical small to 1e-5 and -1e-5
+    viewdir[(viewdir < 1e-5) & (viewdir > -1e-10)] = 1e-5   # (nbody+nrand, 3)
+    viewdir[(viewdir > -1e-5) & (viewdir < 1e-10)] = -1e-5  # (nbody+nrand, 3)
+
+    # compute x_near, x_far, y_near, y_far, z_near, z_far for H*W rays respectively
+    tmin = (bounds[:1]  - ray_o[:1]) / viewdir  # (nbody+nrand, 3), 这边减掉 ray_o 是因为生成 ray_d 时减了 ray_o
+    tmax = (bounds[1:2] - ray_o[:1]) / viewdir  # (nbody+nrand, 3), 这边减掉 ray_o 是因为生成 ray_d 时减了 ray_o
+
+    # compute max(t_xnear, t_ynear, t_znear) and min(t_xfar, t_yfar, t_zfar)
+    t1 = np.minimum(tmin, tmax)     # (nbody+nrand, 3), t_xnear, t_ynear, t_znear
+    t2 = np.maximum(tmin, tmax)     # (nbody+nrand, 3), t_xfar, t_yfar, t_zfar
+    near = np.max(t1, axis=-1)      # (nbody+nrand,), max(t_xnear, t_ynear, t_znear)
+    far  = np.min(t2, axis=-1)      # (nbody+nrand,), min(t_xfar, t_yfar, t_zfar)
+    
+    # if max(t_xnear, t_ynear, t_znear) < min(t_xfar, t_yfar, t_zfar) -> intersect
+    mask_at_box = near < far                            # (nbody+nrand)
+    near = near[mask_at_box] / norm_d[mask_at_box, 0]   # (n,)
+    far  =  far[mask_at_box] / norm_d[mask_at_box, 0]   # (n,)
     return near, far, mask_at_box
 
 
 def sample_ray(img, msk, K, R, T, bounds, nrays, split):
+    """ Sample Rays from Current Image(['train', 'test'])
+    Args:
+        img    - (H, W, 3) of float32, original image of this batch
+        msk    - (H, W, 3) of float32, masked image of the batch
+        K      - (3, 3) of float32, camera's intrinsic matrix
+        R      - (3, 3) of float32, rotation matrix from world to camera
+        T      - (3,) of float32, translation matrix from world to camera
+        bounds - (2, 3) of float32, human vertices bound in world coordinates
+        nrays  - int, namely choose how many rays for this batch
+        split  - ['train', 'test']
+    Returns:
+        rgb         - (nrays, 3), rgb color of each corresponding ray
+        ray_o       - (nrays, 3), rays origin in world coordinates
+        ray_d       - (nrays, 3), rays direction in world coordinates
+        near        - (nrays,), near distance of each ray
+        far         - (nrays,), far distance of each ray
+        coord       - (nrays, 2), correspoding image indices (u, v) of n rays
+        mask_at_box - #? (batch_size,), 都是 1 的一个 array...
+    """
+    # get H*W rays' origin and direction
     H, W = img.shape[:2]
-    ray_o, ray_d = get_rays(H, W, K, R, T)
+    ray_o, ray_d = get_rays(H, W, K, R, T)          # (H, W, 3)
 
-    pose = np.concatenate([R, T], axis=1)
+    # generate 2d human mask which is projected from 3d smpl vertices bounding box
+    pose = np.concatenate([R, T], axis=1)           # (3, 4)
     bound_mask = get_bound_2d_mask(bounds, K, pose, H, W)
-
+    # mask the original input human mask further
     msk = msk * bound_mask
 
+    # sample nrays(batch_size) rays from H*W rays if it is train loader
     if split == 'train':
-        nsampled_rays = 0
-        face_sample_ratio = cfg.face_sample_ratio
-        body_sample_ratio = cfg.body_sample_ratio
+        nsampled_rays = 0                           # number of rays we've sampled
+        face_sample_ratio = cfg.face_sample_ratio   # face_sample_ratio
+        body_sample_ratio = cfg.body_sample_ratio   # body_sample_ratio
         ray_o_list = []
         ray_d_list = []
         rgb_list = []
@@ -91,41 +159,43 @@ def sample_ray(img, msk, K, R, T, bounds, nrays, split):
         mask_at_box_list = []
 
         while nsampled_rays < nrays:
-            n_body = int((nrays - nsampled_rays) * body_sample_ratio)
-            n_face = int((nrays - nsampled_rays) * face_sample_ratio)
-            n_rand = (nrays - nsampled_rays) - n_body - n_face
+            # specify number of rays sampled from human body, face and bound mask just generated
+            n_body = int((nrays - nsampled_rays) * body_sample_ratio)   # num of rays sampled from human body
+            n_face = int((nrays - nsampled_rays) * face_sample_ratio)   # num of rays sampled from human face
+            n_rand = (nrays - nsampled_rays) - n_body - n_face          # num of rays remaining, sampled from bound mask
 
-            # sample rays on body
+            # sample rays on body, msk != 0's places are all human body
             coord_body = np.argwhere(msk != 0)
-            coord_body = coord_body[np.random.randint(0, len(coord_body),
-                                                      n_body)]
-            # sample rays on face
+            coord_body = coord_body[np.random.randint(0, len(coord_body), n_body)]
+            # sample rays on face, msk == 13's place human face
             coord_face = np.argwhere(msk == 13)
             if len(coord_face) > 0:
-                coord_face = coord_face[np.random.randint(
-                    0, len(coord_face), n_face)]
-            # sample rays in the bound mask
+                coord_face = coord_face[np.random.randint(0, len(coord_face), n_face)]
+            # sample rays in the bound mask from bound_mask that just generated
             coord = np.argwhere(bound_mask == 1)
             coord = coord[np.random.randint(0, len(coord), n_rand)]
 
+            # concatenate all the sampled rays indices btw [[0, 0], ... [H-1, W-1]]
             if len(coord_face) > 0:
                 coord = np.concatenate([coord_body, coord_face, coord], axis=0)
             else:
                 coord = np.concatenate([coord_body, coord], axis=0)
+            
+            # fetch ray_o, ray_d, and corresponding rgb using sampled indices
+            ray_o_ = ray_o[coord[:, 0], coord[:, 1]]        # (nbody+nrand, 3)
+            ray_d_ = ray_d[coord[:, 0], coord[:, 1]]        # (nbody+nrand, 3)
+            rgb_   =   img[coord[:, 0], coord[:, 1]]        # (nbody+nrand, 3)
 
-            ray_o_ = ray_o[coord[:, 0], coord[:, 1]]
-            ray_d_ = ray_d[coord[:, 0], coord[:, 1]]
-            rgb_ = img[coord[:, 0], coord[:, 1]]
+            # generate near, far distance for each sampled rays, and further filter rays
+            near_, far_, mask_at_box = get_near_far(bounds, ray_o_, ray_d_) # (n, )
 
-            near_, far_, mask_at_box = get_near_far(bounds, ray_o_, ray_d_)
-
-            ray_o_list.append(ray_o_[mask_at_box])
-            ray_d_list.append(ray_d_[mask_at_box])
-            rgb_list.append(rgb_[mask_at_box])
-            near_list.append(near_)
-            far_list.append(far_)
-            coord_list.append(coord[mask_at_box])
-            mask_at_box_list.append(mask_at_box[mask_at_box])
+            ray_o_list.append(ray_o_[mask_at_box])              # (n, 3), rays origin in world coordinates
+            ray_d_list.append(ray_d_[mask_at_box])              # (n, 3), rays direction in world coordinates
+            rgb_list.append(rgb_[mask_at_box])                  # (n, 3), rgb color of each corresponding ray
+            near_list.append(near_)                             # (n,), near distance of each ray
+            far_list.append(far_)                               # (n,), far distance of each ray
+            coord_list.append(coord[mask_at_box])               # (n, 2), correspoding image indices (u, v) of n rays
+            mask_at_box_list.append(mask_at_box[mask_at_box])   #? 这样不就是全 1 了吗?
             nsampled_rays += len(near_)
 
         ray_o = np.concatenate(ray_o_list).astype(np.float32)
@@ -135,6 +205,8 @@ def sample_ray(img, msk, K, R, T, bounds, nrays, split):
         far = np.concatenate(far_list).astype(np.float32)
         coord = np.concatenate(coord_list)
         mask_at_box = np.concatenate(mask_at_box_list)
+    
+    # generate H*W rays and filter those who intersects with the 3d bounding box if it's test loader
     else:
         rgb = img.reshape(-1, 3).astype(np.float32)
         ray_o = ray_o.reshape(-1, 3).astype(np.float32)

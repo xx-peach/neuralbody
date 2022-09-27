@@ -16,26 +16,39 @@ if cfg.fix_random:
 
 
 def train(cfg, network):
-    trainer = make_trainer(cfg, network)
-    optimizer = make_optimizer(cfg, network)
-    scheduler = make_lr_scheduler(cfg, optimizer)
-    recorder = make_recorder(cfg)
-    evaluator = make_evaluator(cfg)
+    """ Wrap the Network into a Trainer Class and Train the Net
 
+    Args:
+        cfg     - experiment's configuration, including all things
+        network - network object of this experiment
+    Returns:
+        network - None is also ok
+    """
+    # instantiate trainer, optimizer, scheduler, recorder and evaluaor for this exp
+    trainer = make_trainer(cfg, network)            # ./lib/train/trainers/trainers.py
+    optimizer = make_optimizer(cfg, network)        # ./lib/train/optimizer.py
+    scheduler = make_lr_scheduler(cfg, optimizer)   # ./lib/train/scheduler.py
+    recorder = make_recorder(cfg)                   # ./lib/train/recorder.py
+    evaluator = make_evaluator(cfg)                 # ./lib/evaluators.py
+
+    # load pre-trained model if specified and accept begin epoch as return
     begin_epoch = load_model(network,
                              optimizer,
                              scheduler,
                              recorder,
                              cfg.trained_model_dir,
                              resume=cfg.resume)
-    set_lr_scheduler(cfg, scheduler)
+    set_lr_scheduler(cfg, scheduler)                #? don't understand
 
+    # create training data loader
     train_loader = make_data_loader(cfg,
                                     is_train=True,
                                     is_distributed=cfg.distributed,
                                     max_iter=cfg.ep_iter)
+    # creae validation data loader
     val_loader = make_data_loader(cfg, is_train=False)
 
+    # start to train the network
     for epoch in range(begin_epoch, cfg.train.epoch):
         recorder.epoch = epoch
         if cfg.distributed:

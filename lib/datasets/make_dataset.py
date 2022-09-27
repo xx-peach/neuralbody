@@ -68,6 +68,16 @@ def worker_init_fn(worker_id):
 
 
 def make_data_loader(cfg, is_train=True, is_distributed=False, max_iter=-1):
+    """ Create Dataset and Dataloader
+    Args:
+        cfg            - all the configurations for this experiment
+        is_train       - bool, True if training, false if testing
+        is_distributed - bool, True if we're using distributed traing/testing
+        max_iter       - int, maximum number of iterations for one epoch
+    Returns:
+        data_loader - torch.utils.data.DataLoader(dataset, batch_sampler, num_workers, collator, worker_init_fn)
+    """
+    # get `batch_size`, `shuffle`, and `drop_last` configs according to is_train
     if is_train:
         batch_size = cfg.train.batch_size
         # shuffle = True
@@ -78,13 +88,19 @@ def make_data_loader(cfg, is_train=True, is_distributed=False, max_iter=-1):
         shuffle = True if is_distributed else False
         drop_last = False
 
+    # specify the dataset name for this experiment
     dataset_name = cfg.train.dataset if is_train else cfg.test.dataset
-
+    #? create data transform, namely ToTensor() + Normalize(), 没用到
     transforms = make_transforms(cfg, is_train)
+    # create whole dataset for this experiment
     dataset = make_dataset(cfg, dataset_name, transforms, is_train)
+
+    # create data sampler and batch data sampler
     sampler = make_data_sampler(dataset, shuffle, is_distributed, is_train)
     batch_sampler = make_batch_data_sampler(cfg, sampler, batch_size,
                                             drop_last, max_iter, is_train)
+
+    # create final data loader with dataset, batch_sampler, num_workers, collator(default '') and worker_intit_fn
     num_workers = cfg.train.num_workers
     collator = make_collator(cfg, is_train)
     data_loader = torch.utils.data.DataLoader(dataset,
